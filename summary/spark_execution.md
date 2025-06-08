@@ -76,3 +76,25 @@ select * from large_table join small_table on id
 **Without AQE** : shuffle join 이용
 
 **With AQE** : small_table 사이즈 확인 후 broadcast join 진행
+
+#### 3) AQE 기능
+- **Dynamically coalescing shuffle partitions**
+
+  - 작은 크기의 파티션이 있다면 그것들을 하나의 파티션으로 합쳐서 결과적으로 각 파티션들의 크기를 비슷하게 만들어, 무분별하게 파티션 개수가 많아지는 것을 방지하는 기능.
+  - spark의 분산 작업 특성 상, 셔플링은 처리속도가 매우 느린 연산이기 때문에 최적화에 있어서 중요한 대상
+    - 만약 셔플 후 파티션 개수가 적다면 파티션 당 데이터 크기가 커져서, executor의 메모리 크기를 벗어나 OOM(Out Of Memory)를 발생시키거나 디스크를 이용한 연산이 수행되고 또한 분산 처리를 그만큼 활용하지 못해 성능이 떨어진다. 
+    - 반대로 셔플 후 파티션 개수가 많다면 많은 수의 파티션에 대한 메타데이터를 보관하는 스파크 드라이버에 부하가 늘어나고 파티션 스케줄리링에 대한 비용이 커진다. 무엇보다 작은 크기의 파티션들을 셔플링 시 네트워크 I/O 비용이 커져(원인: 네트워크 패킷 헤더 overhead 등) 성능이 떨어진다. 
+    - 따라서, 적절한 파티션 개수를 설정하여 셔플링하는 것이 중요
+
+
+- **Dynamically coalescing shuffle partitions**
+
+  - AQE가 셔플링을 통해 알게 된 조인 테이블의 데이터 사이즈가 spark.sql.autoBroadcastJoinThreshold(default 10MB)에 설정된 값보다 작다면, 이를 브로드캐스트 해시 조인 전략으로 변경한다. 
+  - Broadcast Join은 작은 테이블만 브로드캐스트하므로 shuffle이 없어져 성능 개선 & 디스크 I/O, CPU 자원 절약
+  - **브로드캐스트 해시 조인** : 한쪽 테이블이 충분히 작은 경우, 해당 테이블을 모든 워커 노드에 브로드캐스트(전파)하여, 큰 테이블과 해시조인을 수행.
+
+
+- **Dynamically optimizing skew joins**
+
+  - AQE는 큰 사이즈의 파티션을 자동으로 서브 파티셔닝 해주어 조인 처리 속도를 높이고 executor의 메모리 낭비를 줄인다.
+  - join 시 파티션 하나에 데이터가 많이 몰려있는 상황을 skew라 하는데, 데이터 사이즈가 커 조인 시 오래 걸리거나 데이터 처리 과정에서 disk spill/OOM 발생이 가능하다. 
