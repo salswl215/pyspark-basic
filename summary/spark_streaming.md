@@ -29,7 +29,7 @@
 ![structured-streaming-example-model.png](..%2Fimage%2Fstructured-streaming-example-model.png)
 
 
-### 2. Structured Streaming
+### 2. Structured Streaming 기초
 - Spark SQL 기반 스트림 처리 프레임워크(Dataframe, Dataset, SQL 사용)
 - 데이터 스트림을 '데이터가 연속적으로 추가되는 테이블' 처럼 다룸
   - 새로운 데이터는 row 단위로 쌓으며, 행 추가 시 테이블 업데이트하고 결과 행을 외부 저장장치에 기록
@@ -42,3 +42,90 @@
 
 ![structured-streaming-window.png](..%2Fimage%2Fstructured-streaming-window.png)
 ![structured-streaming-late-data.png](..%2Fimage%2Fstructured-streaming-late-data.png)
+
+### 3. Structured Streaming deep-dive
+
+#### 1) Input / Sink Sources
+- Input Sources
+  - Apache Kafka 0.10 이상 버전
+  - HDFS, S3 등 분산 파일 시스템
+  - 테스트용 socket
+
+- Sink : 스트림의 결과를 저장할 목적지
+  - Apache Kafka 0.10 이상 버전
+  - 거의 모든 파일 포맷
+  - 출력 레코드의 임의 연산을 실행하는 foreach 싱크
+  - 테스트용 콘솔 싱크
+  - 디버깅용 메모리 싱크
+
+#### 2) Output Mode
+
+- Append
+  - 새로운 로우가 결과 테이블에 추가되면, 추가된 데이터만 출력하는 모드
+  - Aggregation 로직과 같은 상태 유지 연산이 불가함
+
+
+- Update
+  - 이전 출력 결과에서 변경된 로우만 출력
+  - 이 모드를 지원하는 싱크는 반드시 저수준 업데이트를 지원해야 하며, 쿼리에서 집계연산이 없다면 append와 동일
+
+
+- Complete
+  - 결과 테이블의 전체 상태를 싱크로 출력
+  - 모두 데이터가 계속 변경될 수 있는 일부 상태 기반 데이터 다룰 때 유용
+  - 저수준 업데이트 지원하지 않을 때도 유용
+
+
+#### 3) Processing Model
+Spark Streaming의 경우 read > transform > sink 로 구성된 micro-batch 형태이며, 이러한 micro-batch가 주기적으로 반복 실행되는 컨셉
+
+![processing_model_spark_streaming.png](..%2Fimage%2Fprocessing_model_spark_streaming.png)
+
+1. Spark Driver가 micro-batch(job으로 볼 수 있음) 코드를 Spark SQL 엔진에 제출
+2. Spark SQL 엔진은 해당 코드를 compile하여 Execution plan을 세움
+3. Backgroung Streaming Thread에서 micro-batch(job)을 트리거함
+4. 백그라운드 프로세스에서 micro-batch(job) 로직이 실행됨. 하나의 micro-batch 프로세스 수행 후 백그라운드는 죽지 않고 그 다음 input 들어올 때까지 대기 후 작업 반복 수행
+
+
+#### 4) Trigger Setting
+
+- **Unspecified** : default로 적용된 기준으로, 현재 배치가 끝나면 다음 배치를 수행. 이때 다음 input 데이터가 들어오지 않았으면 들어올 때까지 대기
+- **Time Interval** : 예를 들어 5분 주기의 배치. 이전 배치주기가 interval보다 길면 해당 배치가 끝나자마자 다음 배치가 시작. 데이터가 input 되지 않으면 배치는 시작 X
+- **one-time (deprecated)** : 실행 시점에 읽을 수 있는 데이터가 있는지 확인하고, 있다면 단 한 번 마이크로배치를 실행
+- **Available-now** : 트리거 실행 시점에 읽을 수 있는 모든 데이터를 여러 마이크로배치로 나눠서 끝까지 처리한 후 종료 (maxFilesPerTrigger for file sources)
+- **Continuous** : 새롭게 적용된 방식으로, milli second 단위의 실시간 스트리밍을 지원. 이 방식은 주기가 매우 짧기 때문에 micro-batch 방식은 적절하지 않아, continuous trigger 방식을 채택하는 아직 실험적인 부분으로 명시됨.
+
+
+```python
+spark = SparkSession \
+    .builder \
+    .appName("StructuredStreamingSum") \
+    .config("spark.streaming.stopGracefullyOnShutdown", "true") \
+    .config("spark.sql.streaming.schemaInference", "true") \
+    .config("maxFilesPerTrigger", 1) \
+    .getOrCreate()
+```
+- `config("spark.streaming.stopGracefullyOnShutdown", "true")`
+  - 스트리밍 작업을 graceful하게 종료하기 위해 설정하는 값
+  - 스트리밍 작업은 계속해서 데이터 처리하고 있음에 따라, 미설정 시 처리 중인 작업 완료하지 않고 종료될 수 있고 데이터 손실 발생 가능함
+- `config("maxFilesPerTrigger", 1)`
+  - 각 트리거링 당 읽을 파일의 최대 수를 설정
+  - 제한을 두어 디스크 I/O가 크게 오르거나, 해당 작업을 위한 리소스 사용량 등 작업 처리에 장애 발생하지 않도록
+- `option("checkpointLocation", "checkpoint")`
+  - 스트리밍 처리의 상태를 유지하기 위한 체크포인트 위치를 설정
+- `trigger(processingTime='5 seconds')`
+  - 처리 간격
+
+
+#### 5) Fault Tolerance
+
+- Spark Goal : **end-to-end exactly-once semantics**
+  - 어떠한 레코드도 놓치지 않고, 중복 없이 데이터를 생성
+
+- How?
+  - checkpoint & WAL (write-ahead-log)을 기반으로 어디까지 처리했고, 어떤 상태였는지를 기록
+  - Read Position(Offsets), State information(group by와 같은 연산 시 이전 배치에서 sum 해놓은 정보를 저장해 놓음으로써 재연산하는 낭비를 줄일 수 있게 함)을 기록함으로써 달성
+  - Replayable한, 재현성이 있는 kafka와 같은 소스 사용 필요
+  - 같은 input에는 동일한 output을 내는 일관된 로직 필요
+  - 재실행이나 중복이 발생해도 시스템의 상태나 결과에 영향이 없어야 함
+
